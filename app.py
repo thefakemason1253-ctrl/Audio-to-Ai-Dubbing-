@@ -11,6 +11,7 @@ import json
 # Optional integrations are demonstrated below using environment variables:
 # - OPENAI_API_KEY: for transcription (Whisper-like) and/or TTS if you choose
 # - ELEVENLABS_API_KEY: for ElevenLabs TTS synthesis
+# - PYANNOTE_AUTH_TOKEN: for speaker diarization using pyannote pipeline (optional)
 # If no API keys are provided, the app will save uploaded files and return them unchanged as a fallback.
 
 UPLOAD_DIR = Path("uploads")
@@ -90,31 +91,194 @@ def synthesize_with_elevenlabs(text: str, out_path: Path, voice: str = "alloy") 
     return out_path
 
 
-def convert_voice_via_transcribe_and_tts(extracted_audio: Path, output_audio: Path, voice: str = "alloy") -> Path:
-    """Simple approach: transcribe audio -> synthesize text with target voice TTS.
-    This is not true voice cloning but yields a dubbed audio track that matches the spoken content.
-    For full voice cloning (preserving prosody/voice characteristics), you will need specialized models (e.g., voice conversion models) or vendor APIs.
+def run_speaker_diarization(wav_path: Path):
+    """Run speaker diarization and return a list of segments: [{"start": float, "end": float, "speaker": "SPEAKER_0"}, ...]
+    This uses pyannote if PYANNOTE_AUTH_TOKEN is set. Otherwise returns a single speaker covering the whole file as a fallback.
     """
-    try:
-        # 1) Transcribe
-        transcript = transcribe_with_openai(extracted_audio)
-    except Exception as e:
-        app.logger.warning("Transcription failed or is not configured: %s", e)
-        transcript = ""
+    token = os.environ.get("PYANNOTE_AUTH_TOKEN")
+    if token:
+        try:
+            # Lazy-import pyannote to avoid making it a hard requirement
+            from pyannote.audio import Pipeline
+            pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization", use_auth_token=token)
+            diarization = pipeline(str(wav_path))
+            segments = []
+            for turn, _, speaker in diarization.itertracks(yield_label=True):
+                segments.append({"start": float(turn.start), "end": float(turn.end), "speaker": speaker})
+            # Normalize speaker labels to simple names
+            speakers_map = {}
+            out = []
+            idx = 0
+            for s in segments:
+                sp = s["speaker"]
+                if sp not in speakers_map:
+                    speakers_map[sp] = f"speaker_{len(speakers_map)+1}"
+                out.append({"start": s["start"], "end": s["end"], "speaker": speakers_map[sp]})
+            return out
+        except Exception as e:
+            app.logger.exception("pyannote diarization failed: %s", e)
+            # fall-through to fallback
 
-    if not transcript:
-        raise RuntimeError("No transcript available; configure a transcription API or provide text input")
-
-    # 2) Synthesize
-    # Prefer ElevenLabs if configured. Fallback to OpenAI TTS could be implemented similarly.
+    # Fallback: single speaker covering whole file
+    # Get duration using ffprobe
     try:
-        if os.environ.get("ELEVENLABS_API_KEY"):
-            return synthesize_with_elevenlabs(transcript, output_audio, voice=voice)
-        else:
-            raise RuntimeError("No TTS provider configured")
-    except Exception as e:
-        app.logger.exception("Synthesis failed: %s", e)
-        raise
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(wav_path),
+        ]
+        out = subprocess.check_output(cmd).decode().strip()
+        duration = float(out) if out else 0.0
+    except Exception:
+        duration = 0.0
+    return [{"start": 0.0, "end": duration, "speaker": "speaker_1"}]
+
+
+def extract_segment(input_path: Path, start: float, end: float, out_path: Path) -> Path:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(input_path),
+        "-ss",
+        str(start),
+        "-to",
+        str(end),
+        "-ar",
+        "16000",
+        "-ac",
+        "1",
+        str(out_path),
+    ]
+    subprocess.check_call(cmd)
+    return out_path
+
+
+def convert_voice_via_transcribe_and_tts_for_segments(input_path: Path, segments, output_audio: Path, voice_map) -> Path:
+    """For each segment, extract audio, transcribe, synthesize using the selected voice for that speaker, then concatenate."""
+    tmp_dir = OUTPUT_DIR / f"tmp_{uuid.uuid4().hex}"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    segment_files = []
+
+    try:
+        for i, seg in enumerate(segments):
+            seg_wav = tmp_dir / f"seg_{i}.wav"
+            # extract from original input audio (not the pre-extracted wav) to preserve timing
+            extract_segment(input_path, seg["start"], seg["end"], seg_wav)
+
+            # Transcribe
+            transcript = ""
+            try:
+                transcript = transcribe_with_openai(seg_wav)
+            except Exception as e:
+                app.logger.warning("Transcription failed for segment %d: %s", i, e)
+
+            # Choose voice for speaker
+            speaker = seg.get("speaker", "speaker_1")
+            voice = voice_map.get(speaker, voice_map.get("default", "alloy"))
+
+            # Synthesize
+            out_seg_mp3 = tmp_dir / f"seg_{i}.mp3"
+            try:
+                if transcript:
+                    if os.environ.get("ELEVENLABS_API_KEY"):
+                        synth_path = tmp_dir / f"seg_{i}_synth.wav"
+                        synthesize_with_elevenlabs(transcript, synth_path, voice=voice)
+                        # convert synth output to mp3 with consistent params
+                        cmd = [
+                            "ffmpeg",
+                            "-y",
+                            "-i",
+                            str(synth_path),
+                            "-acodec",
+                            "libmp3lame",
+                            "-b:a",
+                            "192k",
+                            str(out_seg_mp3),
+                        ]
+                        subprocess.check_call(cmd)
+                    else:
+                        # If no TTS provider, fallback: keep original segment as mp3
+                        cmd = [
+                            "ffmpeg",
+                            "-y",
+                            "-i",
+                            str(seg_wav),
+                            "-acodec",
+                            "libmp3lame",
+                            "-b:a",
+                            "192k",
+                            str(out_seg_mp3),
+                        ]
+                        subprocess.check_call(cmd)
+                else:
+                    # No transcript: fallback to original audio
+                    cmd = [
+                        "ffmpeg",
+                        "-y",
+                        "-i",
+                        str(seg_wav),
+                        "-acodec",
+                        "libmp3lame",
+                        "-b:a",
+                        "192k",
+                        str(out_seg_mp3),
+                    ]
+                    subprocess.check_call(cmd)
+            except Exception as e:
+                app.logger.exception("Synthesis/conversion failed for segment %d: %s", i, e)
+                # as a last resort, copy the segment wav to mp3
+                cmd = [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    str(seg_wav),
+                    "-acodec",
+                    "libmp3lame",
+                    "-b:a",
+                    "192k",
+                    str(out_seg_mp3),
+                ]
+                subprocess.check_call(cmd)
+
+            segment_files.append(out_seg_mp3)
+
+        # Concatenate segment files into final output
+        list_file = tmp_dir / "concat_list.txt"
+        with open(list_file, "w") as f:
+            for p in segment_files:
+                # ffmpeg concat requires paths like: file '/absolute/path'
+                f.write(f"file '{str(p.resolve())}'\n")
+
+        # Create final mp3
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(list_file),
+            "-c",
+            "copy",
+            str(output_audio),
+        ]
+        subprocess.check_call(cmd)
+
+        return output_audio
+    finally:
+        # cleanup
+        try:
+            shutil.rmtree(tmp_dir)
+        except Exception:
+            pass
 
 
 @app.route("/", methods=["GET"])
@@ -140,11 +304,10 @@ def upload():
     return jsonify({"file_id": file_id, "filename": saved_name})
 
 
-@app.route("/generate", methods=["POST"])
-def generate():
+@app.route("/diarize", methods=["POST"])
+def diarize():
     data = request.get_json(force=True)
     file_id = data.get("file_id")
-    target_voice = data.get("voice", "alloy")
     if not file_id:
         return jsonify({"error": "file_id required"}), 400
 
@@ -154,7 +317,46 @@ def generate():
         return jsonify({"error": "file not found"}), 404
     input_path = candidates[0]
 
-    # extract audio
+    # extract a working WAV for diarization
+    wav_path = OUTPUT_DIR / f"{file_id}_for_diarize.wav"
+    try:
+        extract_audio(input_path, wav_path)
+    except Exception as e:
+        app.logger.exception("Error extracting audio for diarization: %s", e)
+        return jsonify({"error": "failed to extract audio for diarization", "details": str(e)}), 500
+
+    try:
+        segments = run_speaker_diarization(wav_path)
+    except Exception as e:
+        app.logger.exception("Diarization failed: %s", e)
+        return jsonify({"error": "diarization failed", "details": str(e)}), 500
+
+    # Build list of unique speakers
+    speakers = []
+    seen = set()
+    for s in segments:
+        if s["speaker"] not in seen:
+            seen.add(s["speaker"])
+            speakers.append({"id": s["speaker"]})
+
+    return jsonify({"segments": segments, "speakers": speakers})
+
+
+@app.route("/generate", methods=["POST"])
+def generate():
+    data = request.get_json(force=True)
+    file_id = data.get("file_id")
+    voice_map = data.get("voice_map", {})
+    if not file_id:
+        return jsonify({"error": "file_id required"}), 400
+
+    # find upload
+    candidates = list(UPLOAD_DIR.glob(f"{file_id}.*"))
+    if not candidates:
+        return jsonify({"error": "file not found"}), 404
+    input_path = candidates[0]
+
+    # extract a working WAV
     extracted = OUTPUT_DIR / f"{file_id}_extracted.wav"
     try:
         extract_audio(input_path, extracted)
@@ -162,12 +364,18 @@ def generate():
         app.logger.exception("Error extracting audio: %s", e)
         return jsonify({"error": "failed to extract audio", "details": str(e)}), 500
 
-    # convert voice (this may call external APIs and take time)
+    # Run diarization to get segments
+    try:
+        segments = run_speaker_diarization(extracted)
+    except Exception as e:
+        app.logger.exception("Error running diarization: %s", e)
+        segments = [{"start": 0.0, "end": 0.0, "speaker": "speaker_1"}]
+
+    # convert voice per segment
     output_file = OUTPUT_DIR / f"{file_id}_dub.mp3"
     try:
-        # If user has not configured any API keys, do a fallback copy of extracted audio to output
+        # If no APIs configured, fallback to a simple conversion of the whole file
         if not (os.environ.get("OPENAI_API_KEY") or os.environ.get("ELEVENLABS_API_KEY")):
-            # fallback: just copy extracted WAV to MP3 using ffmpeg
             cmd = [
                 "ffmpeg",
                 "-y",
@@ -181,8 +389,7 @@ def generate():
             ]
             subprocess.check_call(cmd)
         else:
-            # attempt real conversion pipeline
-            convert_voice_via_transcribe_and_tts(extracted, output_file, voice=target_voice)
+            convert_voice_via_transcribe_and_tts_for_segments(extracted, segments, output_file, voice_map)
     except Exception as e:
         app.logger.exception("Error converting voice: %s", e)
         return jsonify({"error": "voice conversion failed", "details": str(e)}), 500

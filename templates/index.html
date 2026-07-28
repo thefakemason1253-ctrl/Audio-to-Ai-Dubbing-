@@ -6,9 +6,10 @@
     <title>Audio-to-AI-Dubbing</title>
     <style>
       body { font-family: Arial, sans-serif; margin: 40px; }
-      .uploader { border: 2px dashed #ccc; padding: 20px; max-width: 600px; }
+      .uploader { border: 2px dashed #ccc; padding: 20px; max-width: 800px; }
       .hidden { display: none; }
       button { padding: 10px 16px; font-size: 16px; }
+      .speaker-row { margin: 8px 0; }
     </style>
   </head>
   <body>
@@ -18,13 +19,16 @@
       <input id="file-input" type="file" accept="audio/*,video/*">
       <div id="upload-result" class="hidden">
         <p>Uploaded: <span id="uploaded-filename"></span></p>
-        <label for="voice-select">Select target voice (if TTS provider supports it):</label>
-        <select id="voice-select">
-          <option value="alloy">Alloy (example)</option>
-          <option value="femme">Femme (example)</option>
-        </select>
-        <br><br>
-        <button id="generate-btn">Generate dubbed voice</button>
+        <button id="diarize-btn">Detect speakers</button>
+        <div id="speakers" class="hidden">
+          <h3>Detected speakers</h3>
+          <div id="speaker-list"></div>
+          <p>Select a voice for each detected speaker, then click "Generate dubbed voice".</p>
+        </div>
+        <br>
+        <div id="generate-area" class="hidden">
+          <button id="generate-btn">Generate dubbed voice</button>
+        </div>
       </div>
       <div id="status"></div>
       <div id="download" class="hidden">
@@ -38,11 +42,15 @@
       const uploadedFilename = document.getElementById('uploaded-filename');
       const status = document.getElementById('status');
       const generateBtn = document.getElementById('generate-btn');
-      const voiceSelect = document.getElementById('voice-select');
+      const diarizeBtn = document.getElementById('diarize-btn');
+      const speakersDiv = document.getElementById('speakers');
+      const speakerList = document.getElementById('speaker-list');
+      const generateArea = document.getElementById('generate-area');
       const downloadDiv = document.getElementById('download');
       const downloadLink = document.getElementById('download-link');
 
       let uploadedFileId = null;
+      let detectedSegments = [];
 
       fileInput.addEventListener('change', async (e) => {
         const file = e.target.files[0];
@@ -66,18 +74,67 @@
         }
       });
 
+      diarizeBtn.addEventListener('click', async () => {
+        if (!uploadedFileId) {
+          alert('Please upload a file first');
+          return;
+        }
+        status.innerText = 'Detecting speakers... (this may take a while)';
+        try {
+          const resp = await fetch('/diarize', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ file_id: uploadedFileId }),
+          });
+          const j = await resp.json();
+          if (resp.ok) {
+            detectedSegments = j.segments || [];
+            const speakers = j.speakers || [];
+            speakerList.innerHTML = '';
+            speakers.forEach(s => {
+              const row = document.createElement('div');
+              row.className = 'speaker-row';
+              row.innerHTML = `
+                <label>${s.id}</label>
+                <select data-speaker="${s.id}" class="voice-select">
+                  <option value="alloy">Alloy (example)</option>
+                  <option value="femme">Femme (example)</option>
+                  <option value="default">Default</option>
+                </select>
+              `;
+              speakerList.appendChild(row);
+            });
+            speakersDiv.classList.remove('hidden');
+            generateArea.classList.remove('hidden');
+            status.innerText = 'Speaker detection complete.';
+          } else {
+            status.innerText = 'Diarization failed: ' + (j.error || JSON.stringify(j));
+          }
+        } catch (err) {
+          status.innerText = 'Diarization error: ' + err;
+        }
+      });
+
       generateBtn.addEventListener('click', async () => {
         if (!uploadedFileId) {
           alert('Please upload a file first');
           return;
         }
+        // collect voice mapping
+        const selects = Array.from(document.getElementsByClassName('voice-select'));
+        const voice_map = {};
+        selects.forEach(s => {
+          const sp = s.getAttribute('data-speaker');
+          voice_map[sp] = s.value;
+        });
+
         status.innerText = 'Generating dubbed voice (this may take a while)...';
         downloadDiv.classList.add('hidden');
         try {
           const resp = await fetch('/generate', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ file_id: uploadedFileId, voice: voiceSelect.value }),
+            body: JSON.stringify({ file_id: uploadedFileId, voice_map }),
           });
           const j = await resp.json();
           if (resp.ok) {
