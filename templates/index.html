@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Audio-to-AI-Dubbing</title>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 40px; }
+      .uploader { border: 2px dashed #ccc; padding: 20px; max-width: 600px; }
+      .hidden { display: none; }
+      button { padding: 10px 16px; font-size: 16px; }
+    </style>
+  </head>
+  <body>
+    <h1>Audio-to-AI-Dubbing</h1>
+    <div class="uploader">
+      <p>Upload an audio or video file (any length supported; large files may take a while). Supported: mp3, wav, m4a, mp4, mov, mkv, webm, ogg</p>
+      <input id="file-input" type="file" accept="audio/*,video/*">
+      <div id="upload-result" class="hidden">
+        <p>Uploaded: <span id="uploaded-filename"></span></p>
+        <label for="voice-select">Select target voice (if TTS provider supports it):</label>
+        <select id="voice-select">
+          <option value="alloy">Alloy (example)</option>
+          <option value="femme">Femme (example)</option>
+        </select>
+        <br><br>
+        <button id="generate-btn">Generate dubbed voice</button>
+      </div>
+      <div id="status"></div>
+      <div id="download" class="hidden">
+        <p>Download: <a id="download-link" href="#">dubbed audio</a></p>
+      </div>
+    </div>
+
+    <script>
+      const fileInput = document.getElementById('file-input');
+      const uploadResult = document.getElementById('upload-result');
+      const uploadedFilename = document.getElementById('uploaded-filename');
+      const status = document.getElementById('status');
+      const generateBtn = document.getElementById('generate-btn');
+      const voiceSelect = document.getElementById('voice-select');
+      const downloadDiv = document.getElementById('download');
+      const downloadLink = document.getElementById('download-link');
+
+      let uploadedFileId = null;
+
+      fileInput.addEventListener('change', async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        status.innerText = 'Uploading...';
+        const form = new FormData();
+        form.append('file', file);
+        try {
+          const resp = await fetch('/upload', { method: 'POST', body: form });
+          const j = await resp.json();
+          if (resp.ok) {
+            uploadedFileId = j.file_id;
+            uploadedFilename.innerText = j.filename;
+            uploadResult.classList.remove('hidden');
+            status.innerText = 'Upload complete.';
+          } else {
+            status.innerText = 'Upload failed: ' + (j.error || JSON.stringify(j));
+          }
+        } catch (err) {
+          status.innerText = 'Upload error: ' + err;
+        }
+      });
+
+      generateBtn.addEventListener('click', async () => {
+        if (!uploadedFileId) {
+          alert('Please upload a file first');
+          return;
+        }
+        status.innerText = 'Generating dubbed voice (this may take a while)...';
+        downloadDiv.classList.add('hidden');
+        try {
+          const resp = await fetch('/generate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ file_id: uploadedFileId, voice: voiceSelect.value }),
+          });
+          const j = await resp.json();
+          if (resp.ok) {
+            const url = j.download_url;
+            downloadLink.href = url;
+            downloadDiv.classList.remove('hidden');
+            status.innerText = 'Generation complete.';
+          } else {
+            status.innerText = 'Generation failed: ' + (j.error || JSON.stringify(j));
+          }
+        } catch (err) {
+          status.innerText = 'Generation error: ' + err;
+        }
+      });
+    </script>
+  </body>
+</html>
